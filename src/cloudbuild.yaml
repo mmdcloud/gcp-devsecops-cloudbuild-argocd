@@ -1,0 +1,261 @@
+substitutions:
+  _REGION: us-central1
+  _REPO: my-repo
+  _APP: myapp
+  _GITOPS_REPO: org/gitops-repo
+  _GITOPS_BRANCH: main
+  _HELM_PATH: apps/myapp
+  _SBOM_BUCKET: my-sbom-bucket
+  _SNYK_ORG: my-snyk-org
+  _COSIGN_SA: cosign-sa
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+  machineType: E2_HIGHCPU_8
+
+availableSecrets:
+  secretManager:
+    - versionName: projects/$PROJECT_ID/secrets/snyk-token/versions/latest
+      env: SNYK_TOKEN
+    - versionName: projects/$PROJECT_ID/secrets/github-token/versions/latest
+      env: GITHUB_TOKEN
+
+steps:
+
+  # ------------------------------------------------------------------ #
+  # STEP 1 — Unit Tests                                                  #
+  # ------------------------------------------------------------------ #
+  - id: unit-tests
+    name: node:20-alpine
+    entrypoint: sh
+    args:
+      - -c
+      - |
+        npm ci
+        npm test -- --coverage --ci
+    env:
+      - NODE_ENV=test
+
+  # ------------------------------------------------------------------ #
+  # STEP 2 — Semgrep SAST (source code)                                 #
+  # ------------------------------------------------------------------ #
+  - id: semgrep
+    name: returntocorp/semgrep
+    waitFor: [unit-tests]
+    args:
+      - semgrep
+      - scan
+      - --config=auto
+      - --config=p/kubernetes
+      - --config=p/docker
+      - --severity=ERROR
+      - --error
+      - --json-output=semgrep-results.json
+      - .
+
+  # ------------------------------------------------------------------ #
+  # STEP 3 — Checkov IaC scan (Helm + Dockerfile)                       #
+  # ------------------------------------------------------------------ #
+  - id: checkov-helm
+    name: bridgecrew/checkov
+    waitFor: [unit-tests]
+    args:
+      - --directory=./helm
+      - --framework=helm
+      - --hard-fail-on=HIGH,CRITICAL
+      - --soft-fail-on=LOW,MEDIUM
+      - --output=cli
+
+  - id: checkov-dockerfile
+    name: bridgecrew/checkov
+    waitFor: [unit-tests]
+    args:
+      - --file=./Dockerfile
+      - --framework=dockerfile
+      - --hard-fail-on=HIGH,CRITICAL
+      - --output=cli
+
+  # ------------------------------------------------------------------ #
+  # STEP 4 — Snyk SCA (open source dependency scan)                     #
+  # ------------------------------------------------------------------ #
+  - id: snyk-sca
+    name: snyk/snyk:node
+    waitFor: [unit-tests]
+    entrypoint: snyk
+    args:
+      - test
+      - --severity-threshold=high
+      - --fail-on=upgradable
+      - --org=$_SNYK_ORG
+      - --json-file-output=snyk-results.json
+    secretEnv: [SNYK_TOKEN]
+
+  # ------------------------------------------------------------------ #
+  # STEP 5 — Build Docker image                                          #
+  # ------------------------------------------------------------------ #
+  - id: build-image
+    name: gcr.io/cloud-builders/docker
+    waitFor: [semgrep, checkov-helm, checkov-dockerfile, snyk-sca]
+    args:
+      - build
+      - --tag=$_REGION-docker.pkg.dev/$PROJECT_ID/$_REPO/$_APP:$COMMIT_SHA
+      - --tag=$_REGION-docker.pkg.dev/$PROJECT_ID/$_REPO/$_APP:latest
+      - --label=git-commit=$COMMIT_SHA
+      - --label=build-id=$BUILD_ID
+      - --label=repo=$REPO_NAME
+      - --cache-from=$_REGION-docker.pkg.dev/$PROJECT_ID/$_REPO/$_APP:latest
+      - .
+
+  # ------------------------------------------------------------------ #
+  # STEP 6 — Trivy filesystem scan (before push)                        #
+  # ------------------------------------------------------------------ #
+  - id: trivy-fs
+    name: aquasec/trivy
+    waitFor: [build-image]
+    args:
+      - fs
+      - --exit-code=1
+      - --severity=CRITICAL
+      - --ignore-unfixed
+      - --format=table
+      - .
+
+  # ------------------------------------------------------------------ #
+  # STEP 7 — Trivy image scan                                            #
+  # ------------------------------------------------------------------ #
+  - id: trivy-image
+    name: aquasec/trivy
+    waitFor: [build-image]
+    args:
+      - image
+      - --exit-code=1
+      - --severity=CRITICAL,HIGH
+      - --ignore-unfixed
+      - --format=sarif
+      - --output=trivy-results.sarif
+      - $_REGION-docker.pkg.dev/$PROJECT_ID/$_REPO/$_APP:$COMMIT_SHA
+
+  # ------------------------------------------------------------------ #
+  # STEP 8 — Push image to Artifact Registry                            #
+  # ------------------------------------------------------------------ #
+  - id: push-image
+    name: gcr.io/cloud-builders/docker
+    waitFor: [trivy-fs, trivy-image]
+    args:
+      - push
+      - --all-tags
+      - $_REGION-docker.pkg.dev/$PROJECT_ID/$_REPO/$_APP
+
+  # ------------------------------------------------------------------ #
+  # STEP 9 — Syft SBOM generation                                       #
+  # ------------------------------------------------------------------ #
+  - id: syft-sbom
+    name: anchore/syft
+    waitFor: [push-image]
+    args:
+      - $_REGION-docker.pkg.dev/$PROJECT_ID/$_REPO/$_APP:$COMMIT_SHA
+      - -o
+      - spdx-json
+      - --file
+      - sbom.spdx.json
+
+  - id: upload-sbom
+    name: gcr.io/cloud-builders/gsutil
+    waitFor: [syft-sbom]
+    args:
+      - cp
+      - sbom.spdx.json
+      - gs://$_SBOM_BUCKET/$_APP/$COMMIT_SHA/sbom.spdx.json
+
+  # ------------------------------------------------------------------ #
+  # STEP 10 — Cosign keyless image signing                              #
+  # ------------------------------------------------------------------ #
+  - id: cosign-sign
+    name: gcr.io/projectsigstore/cosign
+    waitFor: [push-image]
+    args:
+      - sign
+      - --yes
+      - --annotations=commit=$COMMIT_SHA
+      - --annotations=build-id=$BUILD_ID
+      - --annotations=repo=$REPO_NAME
+      - $_REGION-docker.pkg.dev/$PROJECT_ID/$_REPO/$_APP:$COMMIT_SHA
+    env:
+      - GOOGLE_SERVICE_ACCOUNT_NAME=$_COSIGN_SA@$PROJECT_ID.iam.gserviceaccount.com
+
+  # ------------------------------------------------------------------ #
+  # STEP 11 — Snyk monitor (upload results to Snyk dashboard)           #
+  # ------------------------------------------------------------------ #
+  - id: snyk-monitor
+    name: snyk/snyk:node
+    waitFor: [push-image]
+    entrypoint: snyk
+    args:
+      - container
+      - monitor
+      - --org=$_SNYK_ORG
+      - --app-vulns
+      - $_REGION-docker.pkg.dev/$PROJECT_ID/$_REPO/$_APP:$COMMIT_SHA
+    secretEnv: [SNYK_TOKEN]
+
+  # ------------------------------------------------------------------ #
+  # STEP 12 — Update GitOps repo (triggers ArgoCD sync)                 #
+  # ------------------------------------------------------------------ #
+  - id: update-gitops
+    name: alpine/git
+    waitFor: [cosign-sign, upload-sbom, snyk-monitor]
+    entrypoint: sh
+    args:
+      - -c
+      - |
+        set -e
+
+        # configure git
+        git config --global user.email "cloudbuild@$PROJECT_ID.iam.gserviceaccount.com"
+        git config --global user.name "Cloud Build Bot"
+
+        # clone gitops repo
+        git clone https://$$GITHUB_TOKEN@github.com/$_GITOPS_REPO.git gitops
+        cd gitops
+
+        # update image tag in values.yaml
+        sed -i "s|tag:.*|tag: \"$COMMIT_SHA\"|g" $_HELM_PATH/values.yaml
+
+        # record build metadata
+        sed -i "s|buildId:.*|buildId: \"$BUILD_ID\"|g" $_HELM_PATH/values.yaml
+
+        # commit and push
+        git add $_HELM_PATH/values.yaml
+        git diff --cached --quiet && echo "No changes to commit" && exit 0
+        git commit -m "chore($APP): update image to $COMMIT_SHA [skip ci]
+
+        Build: $BUILD_ID
+        Commit: $COMMIT_SHA
+        Repo: $REPO_NAME
+        Branch: $BRANCH_NAME"
+
+        git push origin $_GITOPS_BRANCH
+    env:
+      - APP=$_APP
+    secretEnv: [GITHUB_TOKEN]
+
+# ------------------------------------------------------------------ #
+# Artifact uploads — store scan results in GCS                        #
+# ------------------------------------------------------------------ #
+artifacts:
+  objects:
+    location: gs://$_SBOM_BUCKET/$_APP/$COMMIT_SHA/
+    paths:
+      - semgrep-results.json
+      - snyk-results.json
+      - trivy-results.sarif
+      - sbom.spdx.json
+
+# ------------------------------------------------------------------ #
+# Images pushed to Artifact Registry                                   #
+# ------------------------------------------------------------------ #
+images:
+  - $_REGION-docker.pkg.dev/$PROJECT_ID/$_REPO/$_APP:$COMMIT_SHA
+  - $_REGION-docker.pkg.dev/$PROJECT_ID/$_REPO/$_APP:latest
+
+timeout: 1800s  # 30 min max build time
