@@ -1,0 +1,36 @@
+appName: nodeapp
+replicaCount: 1
+
+image:
+  repository: us-central1-docker.pkg.dev/$PROJECT_ID/nodeapp/nodeapp
+  tag: latest
+  pullPolicy: IfNotPresent
+
+service:
+  enabled: true
+  name: default
+  type: ClusterIP
+  port: 80
+  targetPort: 8080
+  annotations: {}
+
+ingress:
+  enabled: false
+  name: ""
+  pathType: ImplementationSpecific
+  path: /
+  hosts:
+    - host: chart-example.local
+      paths:
+        - /
+  tls: []  # Treated as an array of objects
+  annotations: {}
+
+resources: {}
+# Limits and requests for CPU and memory can be specified here
+
+nodeSelector: {}
+
+tolerations: []
+
+affinity: {}

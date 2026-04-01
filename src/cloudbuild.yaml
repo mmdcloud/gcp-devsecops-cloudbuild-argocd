@@ -1,12 +1,12 @@
 substitutions:
   _REGION: us-central1
-  _REPO: my-repo
-  _APP: myapp
-  _GITOPS_REPO: org/gitops-repo
+  _REPO: nodeapp
+  _APP: nodeapp
+  _GITOPS_REPO: org/nodeapp
   _GITOPS_BRANCH: main
-  _HELM_PATH: apps/myapp
-  _SBOM_BUCKET: my-sbom-bucket
-  _SNYK_ORG: my-snyk-org
+  _HELM_PATH: apps/nodeapp
+  _SBOM_BUCKET: nodeapp-sbom-bucket
+  _SNYK_ORG: nodeapp-snyk-org
   _COSIGN_SA: cosign-sa
 
 options:
